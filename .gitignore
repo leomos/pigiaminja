@@ -1,0 +1,16 @@
+.DS_Store
+.idea/
+/target
+*.iml
+**/*.rs.bk
+**/*.code-workspace
+*.csv
+*.profraw
+*.profdata
+*.gcov
+*.lcov
+*.xml
+lcov.info
+playground.rs
+*.env
+*.pyc

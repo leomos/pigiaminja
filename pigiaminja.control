@@ -1,0 +1,5 @@
+comment = 'Jinja template formatting support for PostgreSQL COPY TO command'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pigiaminja'
+relocatable = false
+superuser = true

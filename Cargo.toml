@@ -1,0 +1,36 @@
+[package]
+name = "pigiaminja"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "pgrx_embed_pigiaminja"
+path = "./src/bin/pgrx_embed.rs"
+
+[features]
+default = ["pg17"]
+pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
+pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
+pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
+pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
+pg_test = []
+
+[dependencies]
+pgrx = "=0.15.0"
+tera = "1.20"
+serde_json = "1"
+
+[dev-dependencies]
+pgrx-tests = "=0.15.0"
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
