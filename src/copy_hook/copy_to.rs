@@ -7,7 +7,7 @@ use pgrx::{
         pq_sendbyte, pq_sendbytes, pq_sendint16, CommandTag, CopyStmt, DefElem, DestReceiver,
         NodeTag::T_CopyStmt, PlannedStmt, QueryCompletion,
     },
-    prelude::*, PgBox, PgList
+    PgBox, PgList
 };
 
 use super::hook::ENABLE_JINJA_COPY_HOOK;
@@ -27,21 +27,24 @@ pub(crate) fn execute_copy_to_jinja(
     let is_to_stdout = copy_stmt.filename.is_null();
     
     unsafe {
+        // Extract the template path from the COPY statement
+        let template_path = extract_jinja_template(p_stmt).unwrap_or_default();
+        
         // For COPY TO STDOUT, send the placeholder data using PostgreSQL's copy protocol
         if is_to_stdout {
             // Send COPY begin message
             send_copy_begin(1, false); // 1 column, text format
             
-            // Send the placeholder data
-            let placeholder = "JINJA_EXTENTIONS_PLACEHOLDER\n";
-            send_copy_data(placeholder.as_bytes());
+            // Send the placeholder data with template path
+            let output = format!("JINJA_EXTENTIONS_PLACEHOLDER\n{}\n", template_path);
+            send_copy_data(output.as_bytes());
             
             // Send COPY end message
             send_copy_end();
         } else {
             // For COPY TO file, use the standard PostgreSQL file writing mechanism
             // For now, just output a notice as a fallback
-            pgrx::notice!("JINJA_EXTENTIONS_PLACEHOLDER");
+            pgrx::notice!("JINJA_EXTENTIONS_PLACEHOLDER\n{}", template_path);
         }
         
         // Set completion status
@@ -74,13 +77,36 @@ pub(crate) fn is_copy_to_jinja_stmt(p_stmt: &PgBox<PlannedStmt>) -> bool {
     }
 
     // Check if format is jinja
-    is_jinja_format_option(p_stmt)
+    let is_jinja = is_jinja_format_option(p_stmt);
+    
+    // If format is jinja, template option is mandatory
+    if is_jinja {
+        let template_option = copy_stmt_get_option(p_stmt, "template");
+        if template_option.is_null() {
+            pgrx::error!("template option is required when using jinja format");
+        }
+    }
+    
+    is_jinja
 }
 
-/// Extract Jinja template from COPY statement options (placeholder for future expansion)
-pub(crate) fn extract_jinja_template(_p_stmt: &PgBox<PlannedStmt>) -> Option<String> {
-    // Placeholder implementation - in the future this could parse template options
-    None
+/// Extract Jinja template path from COPY statement options
+pub(crate) fn extract_jinja_template(p_stmt: &PgBox<PlannedStmt>) -> Option<String> {
+    let template_option = copy_stmt_get_option(p_stmt, "template");
+    
+    if template_option.is_null() {
+        return None;
+    }
+    
+    let template_path = unsafe { defGetString(template_option.as_ptr()) };
+    
+    let template_path = unsafe {
+        CStr::from_ptr(template_path)
+            .to_str()
+            .unwrap_or_else(|e| panic!("template option is not a valid CString: {e}"))
+    };
+    
+    Some(template_path.to_string())
 }
 
 /// Get a COPY statement option by name
