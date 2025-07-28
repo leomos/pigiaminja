@@ -1,8 +1,8 @@
 use std::ffi::{c_char, CStr};
 
 use pgrx::pg_sys::{
-    standard_ProcessUtility, DestReceiver, ParamListInfoData, PlannedStmt,
-    ProcessUtility_hook, ProcessUtility_hook_type, QueryCompletion, QueryEnvironment,
+    standard_ProcessUtility, DestReceiver, ParamListInfoData, PlannedStmt, ProcessUtility_hook,
+    ProcessUtility_hook_type, QueryCompletion, QueryEnvironment,
 };
 use pgrx::{prelude::*, GucSetting};
 
@@ -31,14 +31,14 @@ fn process_copy_to_jinja(
     query_completion: *mut QueryCompletion,
 ) -> bool {
     // Import the functions from copy_to module
-    use crate::copy_hook::copy_to::{is_copy_to_jinja_stmt, execute_copy_to_jinja};
-    
+    use crate::copy_hook::copy_to::{execute_copy_to_jinja, is_copy_to_jinja_stmt};
+
     // Check if this is a COPY TO statement with jinja format
     if is_copy_to_jinja_stmt(p_stmt) {
         execute_copy_to_jinja(p_stmt, query_string, read_only_tree, dest, query_completion);
         return true;
     }
-    
+
     false
 }
 
