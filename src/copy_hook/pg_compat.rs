@@ -1,8 +1,6 @@
 use std::ffi::c_char;
 
-use pgrx::{
-    pg_sys::{List, QueryEnvironment, RawStmt},
-};
+use pgrx::pg_sys::{List, QueryEnvironment, RawStmt};
 
 // PostgreSQL version compatibility function for pg_analyze_and_rewrite
 pub(crate) fn pg_analyze_and_rewrite(

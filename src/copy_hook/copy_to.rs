@@ -3,12 +3,13 @@ use std::ffi::{CStr, CString};
 use pgrx::{
     is_a,
     pg_sys::{
-        defGetString, makeStringInfo, pg_plan_query, pq_beginmessage,
-        pq_endmessage, pq_putemptymessage, pq_sendbyte, pq_sendint16,
-        A_Star, ColumnRef, CommandTag, CopyStmt, CreateNewPortal, DefElem, DestReceiver,
-        GetActiveSnapshot, Node, NodeTag::{self, T_CopyStmt}, ParamListInfoData, PlannedStmt,
-        PortalDefineQuery, PortalDrop, PortalRun, PortalStart, QueryCompletion,
-        QueryEnvironment, RangeVar, RawStmt, ResTarget, SelectStmt, CURSOR_OPT_PARALLEL_OK,
+        defGetString, makeStringInfo, pg_plan_query, pq_beginmessage, pq_endmessage,
+        pq_putemptymessage, pq_sendbyte, pq_sendint16, A_Star, ColumnRef, CommandTag, CopyStmt,
+        CreateNewPortal, DefElem, DestReceiver, GetActiveSnapshot, Node,
+        NodeTag::{self, T_CopyStmt},
+        ParamListInfoData, PlannedStmt, PortalDefineQuery, PortalDrop, PortalRun, PortalStart,
+        QueryCompletion, QueryEnvironment, RangeVar, RawStmt, ResTarget, SelectStmt,
+        CURSOR_OPT_PARALLEL_OK,
     },
     AllocatedByRust, PgBox, PgList,
 };
@@ -31,9 +32,9 @@ pub(crate) fn execute_copy_to_jinja(
         // Extract the template path from the COPY statement
         let template_path = extract_jinja_template(p_stmt)
             .unwrap_or_else(|| pgrx::error!("template option is required for jinja format"));
-        
-        let template_path_cstr = CString::new(template_path)
-            .expect("Failed to create CString from template path");
+
+        let template_path_cstr =
+            CString::new(template_path).expect("Failed to create CString from template path");
 
         // Create custom Jinja DestReceiver
         let jinja_dest = create_jinja_dest_receiver(template_path_cstr.as_ptr());
@@ -178,7 +179,7 @@ fn execute_copy_to_with_dest_receiver(
             // COPY table TO
             let relation = PgBox::from_pg(copy_stmt.relation);
             let select_stmt = convert_copy_to_relation_to_select_stmt(&copy_stmt, &relation);
-            
+
             let mut raw_query = PgBox::<RawStmt, AllocatedByRust>::alloc_node(NodeTag::T_RawStmt);
             raw_query.stmt_location = p_stmt.stmt_location;
             raw_query.stmt_len = p_stmt.stmt_len;
@@ -282,7 +283,8 @@ fn convert_copy_to_relation_to_select_stmt(
             // SELECT a,b,... FROM relation
             let attribute_name_list = PgList::<Node>::from_pg(copy_stmt.attlist);
             for attribute_name in attribute_name_list.iter_ptr() {
-                let mut col_ref = PgBox::<ColumnRef, AllocatedByRust>::alloc_node(NodeTag::T_ColumnRef);
+                let mut col_ref =
+                    PgBox::<ColumnRef, AllocatedByRust>::alloc_node(NodeTag::T_ColumnRef);
 
                 let mut field_list = PgList::new();
                 field_list.push(attribute_name);
@@ -290,7 +292,8 @@ fn convert_copy_to_relation_to_select_stmt(
                 col_ref.fields = field_list.into_pg();
                 col_ref.location = -1;
 
-                let mut target = PgBox::<ResTarget, AllocatedByRust>::alloc_node(NodeTag::T_ResTarget);
+                let mut target =
+                    PgBox::<ResTarget, AllocatedByRust>::alloc_node(NodeTag::T_ResTarget);
                 target.name = std::ptr::null_mut();
                 target.indirection = std::ptr::null_mut();
                 target.val = col_ref.into_pg() as _;
@@ -300,7 +303,8 @@ fn convert_copy_to_relation_to_select_stmt(
             }
         }
 
-        let mut select_stmt = PgBox::<SelectStmt, AllocatedByRust>::alloc_node(NodeTag::T_SelectStmt);
+        let mut select_stmt =
+            PgBox::<SelectStmt, AllocatedByRust>::alloc_node(NodeTag::T_SelectStmt);
         select_stmt.targetList = target_list.into_pg();
 
         let mut from_list = PgList::new();
