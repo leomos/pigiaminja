@@ -1,5 +1,4 @@
 use std::ffi::{c_char, CStr};
-use std::fs;
 
 use minijinja::{context, Environment};
 use pgrx::{
@@ -16,11 +15,10 @@ use serde_json::{Map, Value as JsonValue};
 #[repr(C)]
 pub(crate) struct JinjaDestReceiver {
     dest: DestReceiver,
-    template_path: *const c_char,
     natts: usize,
     tupledesc: TupleDesc,
     env: *mut Environment<'static>,
-    template_content: *mut String,
+    template_string: *mut String,
     memory_context: MemoryContext,
 }
 
@@ -58,12 +56,12 @@ impl JinjaDestReceiver {
                 .env
                 .as_ref()
                 .expect("Jinja environment not initialized");
-            let template_content = self
-                .template_content
+            let template_string = self
+                .template_string
                 .as_ref()
                 .expect("Template content not loaded");
 
-            match env.render_str(template_content, context! { row => row_dict }) {
+            match env.render_str(template_string, context! { row => row_dict }) {
                 Ok(rendered) => self.send_copy_data(rendered.as_bytes()),
                 Err(e) => pgrx::error!("Failed to render Jinja template: {}", e),
             }
@@ -204,23 +202,11 @@ pub(crate) extern "C-unwind" fn jinja_startup(
         let tupledesc = PgTupleDesc::from_pg_unchecked(jinja_dest.tupledesc);
         jinja_dest.natts = tupledesc.len();
 
-        // Load template content
-        let template_path = CStr::from_ptr(jinja_dest.template_path)
-            .to_str()
-            .expect("template path is not a valid C string");
-
-        let template_content = fs::read_to_string(template_path).unwrap_or_else(|e| {
-            pgrx::error!("Failed to read template file '{}': {}", template_path, e)
-        });
-
         // Initialize Jinja environment
         let mut ctx = PgMemoryContexts::For(jinja_dest.memory_context);
         ctx.switch_to(|_context| {
             let env = Box::new(Environment::new());
-            let template_content = Box::new(template_content);
-
             jinja_dest.env = Box::into_raw(env);
-            jinja_dest.template_content = Box::into_raw(template_content);
         });
     }
 }
@@ -256,9 +242,9 @@ pub(crate) extern "C-unwind" fn jinja_shutdown(dest: *mut DestReceiver) {
             jinja_dest.env = std::ptr::null_mut();
         }
 
-        if !jinja_dest.template_content.is_null() {
-            let _ = Box::from_raw(jinja_dest.template_content);
-            jinja_dest.template_content = std::ptr::null_mut();
+        if !jinja_dest.template_string.is_null() {
+            let _ = Box::from_raw(jinja_dest.template_string);
+            jinja_dest.template_string = std::ptr::null_mut();
         }
     }
 }
@@ -269,7 +255,7 @@ pub(crate) extern "C-unwind" fn jinja_destroy(_dest: *mut DestReceiver) {}
 // Create a new JinjaDestReceiver
 #[pg_guard]
 pub(crate) extern "C-unwind" fn create_jinja_dest_receiver(
-    template_path: *const c_char,
+    template_content: *const c_char,
 ) -> *mut JinjaDestReceiver {
     let memory_context = unsafe {
         pg_sys::AllocSetContextCreateExtended(
@@ -289,11 +275,18 @@ pub(crate) extern "C-unwind" fn create_jinja_dest_receiver(
     jinja_dest.dest.rDestroy = Some(jinja_destroy);
     jinja_dest.dest.mydest = CommandDest::DestCopyOut;
 
-    jinja_dest.template_path = template_path;
+    // Convert template content from C string to Rust String
+    let template_string = unsafe {
+        CStr::from_ptr(template_content)
+            .to_str()
+            .expect("template content is not a valid C string")
+            .to_string()
+    };
+
     jinja_dest.tupledesc = std::ptr::null_mut();
     jinja_dest.natts = 0;
     jinja_dest.env = std::ptr::null_mut();
-    jinja_dest.template_content = std::ptr::null_mut();
+    jinja_dest.template_string = Box::into_raw(Box::new(template_string));
     jinja_dest.memory_context = memory_context;
 
     jinja_dest.into_pg()
