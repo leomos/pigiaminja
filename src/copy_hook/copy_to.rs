@@ -29,15 +29,15 @@ pub(crate) fn execute_copy_to_jinja(
     unsafe {
         let _copy_stmt = PgBox::<CopyStmt>::from_pg(p_stmt.utilityStmt as _);
 
-        // Extract the template path from the COPY statement
-        let template_path = extract_jinja_template(p_stmt)
+        // Extract the template content from the COPY statement
+        let template_content = extract_jinja_template(p_stmt)
             .unwrap_or_else(|| pgrx::error!("template option is required for jinja format"));
-
-        let template_path_cstr =
-            CString::new(template_path).expect("Failed to create CString from template path");
+        
+        let template_content_cstr = CString::new(template_content)
+            .expect("Failed to create CString from template content");
 
         // Create custom Jinja DestReceiver
-        let jinja_dest = create_jinja_dest_receiver(template_path_cstr.as_ptr());
+        let jinja_dest = create_jinja_dest_receiver(template_content_cstr.as_ptr());
 
         // Prepare parameters - create from null pointers
         let params = PgBox::<ParamListInfoData>::from_pg(std::ptr::null_mut());
@@ -95,7 +95,7 @@ pub(crate) fn is_copy_to_jinja_stmt(p_stmt: &PgBox<PlannedStmt>) -> bool {
     is_jinja
 }
 
-/// Extract Jinja template path from COPY statement options
+/// Extract Jinja template content from COPY statement options
 pub(crate) fn extract_jinja_template(p_stmt: &PgBox<PlannedStmt>) -> Option<String> {
     let template_option = copy_stmt_get_option(p_stmt, "template");
 
@@ -103,15 +103,15 @@ pub(crate) fn extract_jinja_template(p_stmt: &PgBox<PlannedStmt>) -> Option<Stri
         return None;
     }
 
-    let template_path = unsafe { defGetString(template_option.as_ptr()) };
+    let template_content = unsafe { defGetString(template_option.as_ptr()) };
 
-    let template_path = unsafe {
-        CStr::from_ptr(template_path)
+    let template_content = unsafe {
+        CStr::from_ptr(template_content)
             .to_str()
             .unwrap_or_else(|e| panic!("template option is not a valid CString: {e}"))
     };
 
-    Some(template_path.to_string())
+    Some(template_content.to_string())
 }
 
 /// Get a COPY statement option by name
