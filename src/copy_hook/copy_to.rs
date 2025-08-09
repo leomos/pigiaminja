@@ -32,9 +32,9 @@ pub(crate) fn execute_copy_to_jinja(
         // Extract the template content from the COPY statement
         let template_content = extract_jinja_template(p_stmt)
             .unwrap_or_else(|| pgrx::error!("template option is required for jinja format"));
-        
-        let template_content_cstr = CString::new(template_content)
-            .expect("Failed to create CString from template content");
+
+        let template_content_cstr =
+            CString::new(template_content).expect("Failed to create CString from template content");
 
         // Create custom Jinja DestReceiver
         let jinja_dest = create_jinja_dest_receiver(template_content_cstr.as_ptr());
