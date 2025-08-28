@@ -99,3 +99,23 @@ You can build for another version like this:
 docker build --build-arg PG_MAJOR=14 -t pigiaminja:postgres_14 .
 ```
 
+### Using source code
+
+You can install the extension and start developing it by using `pgrx`.
+
+Assuming you already have `cargo` installed:
+
+```
+$ git clone https://github.com/leomos/pigiaminja
+$ cd pigiaminja
+$ export CARGO_PGRX_VERSION=0.15.0
+$ export PG_MAJOR=17
+$ cargo install --force --locked cargo-pgrx@"${CARGO_PGRX_VERSION}"
+$ cargo pgrx init 
+# or if you have a locally installed postgres instance
+$ cargo pgrx init --pg"${PG_MAJOR}" $(which pg_config)
+$ echo "shared_preload_libraries = 'pigiaminja'" >> ~/.pgrx/data-"${PG_MAJOR}"/postgresql.conf
+
+$ cargo pgrx run --features pg"${PG_MAJOR}"
+psql> "CREATE EXTENSION pigiaminja;"
+```
