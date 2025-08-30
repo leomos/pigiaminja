@@ -39,18 +39,10 @@ pigiaminja=# COPY (
 
 ### Using Docker
 
-The easiest way to try this is by building a docker image that contains the extension:
+The easiest way to try this is by using a pre-built docker image that contains the extension, `ghcr.io/leomos/pigiaminja`:
 
 ```
-$ git clone https://github.com/leomos/pigiaminja
-$ cd pigiaminja
-$ docker build -t pigiaminja .
-```
-
-You can then use it as normal PostgreSQL docker image:
-
-```
-$ docker run --name some-postgres -e POSTGRES_PASSWORD=mysecretpassword -d pigiaminja
+$ docker run --name some-postgres -e POSTGRES_PASSWORD=mysecretpassword -d ghcr.io/leomos/pigiaminja
 $ docker exec -it some-postgres psql -U postgres
 psql (17.5 (Debian 17.5-1.pgdg120+1))
 Type "help" for help.
@@ -89,6 +81,18 @@ postgres=# COPY (
 </tr>postgres=#
 ```
 
+The `pigiaminja` image is a debian PostgreSQL 17 image with the pre-compiled extension built into.
+
+#### Building docker image
+
+You can build the docker image with:
+
+```
+$ git clone https://github.com/leomos/pigiaminja
+$ cd pigiaminja
+$ docker build -t pigiaminja .
+```
+
 The `Dockerfile` accepts the `PG_MAJOR` argument to define the major version of the PostgreSQL image that pigiaminja will be built on.
 
 The default PostgreSQL image version is `17` by it's been tested with `14`, `15` and `16`.
@@ -114,8 +118,11 @@ $ cargo install --force --locked cargo-pgrx@"${CARGO_PGRX_VERSION}"
 $ cargo pgrx init 
 # or if you have a locally installed postgres instance
 $ cargo pgrx init --pg"${PG_MAJOR}" $(which pg_config)
-$ echo "shared_preload_libraries = 'pigiaminja'" >> ~/.pgrx/data-"${PG_MAJOR}"/postgresql.conf
-
+$ echo "shared_preload_libraries = 'pigiaminja'" >> ~/.pgrx/data-"${PG_MAJOR}"/postgresql.con
 $ cargo pgrx run --features pg"${PG_MAJOR}"
 psql> "CREATE EXTENSION pigiaminja;"
 ```
+
+## Credits
+
+Implementation of the extension internals is heavily inspired by [pg_parquet](https://github.com/CrunchyData/pg_parquet).
