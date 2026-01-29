@@ -16,6 +16,7 @@ use pgrx::{
 
 use super::dest_receiver::create_jinja_dest_receiver;
 use super::hook::ENABLE_JINJA_COPY_HOOK;
+use super::output::CopyDestination;
 use super::pg_compat::pg_analyze_and_rewrite;
 
 /// Execute COPY TO with Jinja template formatting using DestReceiver pattern
@@ -27,7 +28,7 @@ pub(crate) fn execute_copy_to_jinja(
     query_completion: *mut QueryCompletion,
 ) {
     unsafe {
-        let _copy_stmt = PgBox::<CopyStmt>::from_pg(p_stmt.utilityStmt as _);
+        let copy_stmt = PgBox::<CopyStmt>::from_pg(p_stmt.utilityStmt as _);
 
         // Extract the template content from the COPY statement
         let template_content = extract_jinja_template(p_stmt)
@@ -36,8 +37,23 @@ pub(crate) fn execute_copy_to_jinja(
         let template_content_cstr =
             CString::new(template_content).expect("Failed to create CString from template content");
 
+        // Detect the output destination
+        let output_destination = CopyDestination::from_copy_stmt(
+            copy_stmt.filename,
+            copy_stmt.is_program,
+        )
+        .unwrap_or_else(|e| pgrx::error!("{}", e));
+
+        let is_stdout = output_destination.is_stdout();
+
+        // Box the destination to pass as pointer
+        let output_destination_ptr = Box::into_raw(Box::new(output_destination));
+
         // Create custom Jinja DestReceiver
-        let jinja_dest = create_jinja_dest_receiver(template_content_cstr.as_ptr());
+        let jinja_dest = create_jinja_dest_receiver(
+            template_content_cstr.as_ptr(),
+            output_destination_ptr,
+        );
 
         // Prepare parameters - create from null pointers
         let params = PgBox::<ParamListInfoData>::from_pg(std::ptr::null_mut());
@@ -50,6 +66,7 @@ pub(crate) fn execute_copy_to_jinja(
             &params,
             &query_env,
             &PgBox::from_pg(jinja_dest as *mut DestReceiver),
+            is_stdout,
         );
 
         // Set completion status
@@ -163,6 +180,7 @@ fn execute_copy_to_with_dest_receiver(
     params: &PgBox<ParamListInfoData>,
     query_env: &PgBox<QueryEnvironment>,
     jinja_dest: &PgBox<DestReceiver>,
+    is_stdout: bool,
 ) -> i64 {
     unsafe {
         let copy_stmt = PgBox::<CopyStmt>::from_pg(p_stmt.utilityStmt as _);
@@ -187,8 +205,10 @@ fn execute_copy_to_with_dest_receiver(
             raw_query
         };
 
-        // Send COPY begin message
-        send_copy_begin(1, false); // 1 column, text format
+        // Send COPY begin message (only for STDOUT)
+        if is_stdout {
+            send_copy_begin(1, false); // 1 column, text format
+        }
 
         // Analyze and rewrite the query
         let rewritten_queries = pg_analyze_and_rewrite(
@@ -256,8 +276,10 @@ fn execute_copy_to_with_dest_receiver(
             &mut completion_tag as _,
         );
 
-        // Send COPY end message
-        send_copy_end();
+        // Send COPY end message (only for STDOUT)
+        if is_stdout {
+            send_copy_end();
+        }
 
         PortalDrop(portal.as_ptr(), false);
 

@@ -5,13 +5,15 @@ use minijinja::value::{Enumerator, Object};
 use minijinja::{context, Environment, Value};
 use pgrx::{
     pg_sys::{
-        makeStringInfo, pfree, pq_beginmessage_reuse, pq_endmessage_reuse, slot_getallattrs,
-        AsPgCStr, BlessTupleDesc, CommandDest, CurrentMemoryContext, Datum, DestReceiver,
-        MemoryContext, StringInfoData, TupleDesc, TupleTableSlot,
+        makeStringInfo, pfree, pq_beginmessage_reuse, pq_endmessage_reuse, resetStringInfo,
+        slot_getallattrs, AsPgCStr, BlessTupleDesc, CommandDest, CurrentMemoryContext, Datum,
+        DestReceiver, MemoryContext, StringInfoData, TupleDesc, TupleTableSlot,
     },
     prelude::*,
     AllocatedByPostgres, FromDatum, PgBox, PgMemoryContexts, PgTupleDesc,
 };
+
+use super::output::CopyDestination;
 
 const TEMPLATE_NAME: &str = "row";
 
@@ -69,6 +71,8 @@ pub(crate) struct JinjaDestReceiver {
     tupledesc: TupleDesc,
     env: *mut Environment<'static>,
     template_string: *mut String,
+    /// Where rendered rows go: stdout (wire protocol), a file, or a program's stdin.
+    output_destination: *mut CopyDestination,
     memory_context: MemoryContext,
     /// Shared column names, Arc-cloned into each row (never re-allocated per row).
     column_names: *mut Arc<Vec<Box<str>>>,
@@ -115,16 +119,36 @@ impl JinjaDestReceiver {
                 .get_template(TEMPLATE_NAME)
                 .expect("Pre-compiled template not found");
 
-            // Render directly into the reused COPY-data buffer. Avoids a per-row
-            // output String allocation plus an extra full-row copy.
+            // Render directly into the reused buffer. Avoids a per-row output
+            // String allocation plus an extra full-row copy. For STDOUT the
+            // buffer is the wire message itself, framed by the pq_*_reuse
+            // calls; for file/program destinations it is scratch space whose
+            // payload is handed to the CopyDestination.
+            let destination = self
+                .output_destination
+                .as_mut()
+                .expect("output destination not initialized");
+
             let buf = self.copy_buf;
-            pq_beginmessage_reuse(buf, b'd' as _);
+            if destination.is_stdout() {
+                pq_beginmessage_reuse(buf, b'd' as _);
+            } else {
+                resetStringInfo(buf);
+            }
             if let Err(e) =
                 template.render_to_write(context! { row => row }, StringInfoWriter(buf))
             {
                 pgrx::error!("Failed to render Jinja template: {}", e);
             }
-            pq_endmessage_reuse(buf);
+            if destination.is_stdout() {
+                pq_endmessage_reuse(buf);
+            } else {
+                let data =
+                    std::slice::from_raw_parts((*buf).data as *const u8, (*buf).len as usize);
+                if let Err(e) = destination.write_data(data) {
+                    pgrx::error!("Failed to write COPY data: {}", e);
+                }
+            }
         }
     }
 }
@@ -337,6 +361,14 @@ pub(crate) extern "C-unwind" fn jinja_shutdown(dest: *mut DestReceiver) {
             pfree(jinja_dest.copy_buf as _);
             jinja_dest.copy_buf = std::ptr::null_mut();
         }
+
+        if !jinja_dest.output_destination.is_null() {
+            let mut destination = Box::from_raw(jinja_dest.output_destination);
+            if let Err(e) = destination.finalize() {
+                pgrx::warning!("Failed to finalize output destination: {}", e);
+            }
+            jinja_dest.output_destination = std::ptr::null_mut();
+        }
     }
 }
 
@@ -347,6 +379,7 @@ pub(crate) extern "C-unwind" fn jinja_destroy(_dest: *mut DestReceiver) {}
 #[pg_guard]
 pub(crate) extern "C-unwind" fn create_jinja_dest_receiver(
     template_content: *const c_char,
+    output_destination: *mut CopyDestination,
 ) -> *mut JinjaDestReceiver {
     let memory_context = unsafe {
         pg_sys::AllocSetContextCreateExtended(
@@ -378,6 +411,7 @@ pub(crate) extern "C-unwind" fn create_jinja_dest_receiver(
     jinja_dest.natts = 0;
     jinja_dest.env = std::ptr::null_mut();
     jinja_dest.template_string = Box::into_raw(Box::new(template_string));
+    jinja_dest.output_destination = output_destination;
     jinja_dest.memory_context = memory_context;
     jinja_dest.column_names = std::ptr::null_mut();
     jinja_dest.column_convs = std::ptr::null_mut();
