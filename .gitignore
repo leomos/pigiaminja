@@ -14,3 +14,6 @@ lcov.info
 playground.rs
 *.env
 *.pyc
+perf.data
+profile.json.gz
+flamegraph.svg
