@@ -1,4 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "psycopg[binary]>=3.1",
+# ]
+# ///
 """
 Benchmark: pigiaminja (Jinja COPY TO) vs native COPY CSV vs psycopg client-side CSV
 
@@ -6,6 +12,11 @@ Compares three approaches for exporting PostgreSQL data:
   A) pigiaminja COPY TO with FORMAT 'jinja' (server-side Jinja rendering)
   B) Native COPY TO with FORMAT CSV (PostgreSQL built-in, baseline)
   C) psycopg client-side: SELECT + Python string formatting
+
+Usage:
+  uv run benchmark/bench.py
+  uv run benchmark/bench.py --row-counts 100000
+  uv run benchmark/bench.py --dsn "host=localhost dbname=postgres user=postgres password=secret"
 """
 
 import argparse
