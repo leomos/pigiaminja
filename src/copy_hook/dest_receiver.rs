@@ -3,9 +3,10 @@ use std::ffi::{c_char, CStr};
 use minijinja::{context, Environment};
 use pgrx::{
     pg_sys::{
-        makeStringInfo, pq_beginmessage, pq_endmessage, pq_sendbytes, slot_getallattrs, AsPgCStr,
-        BlessTupleDesc, CommandDest, CurrentMemoryContext, Datum, DestReceiver, MemoryContext,
-        TupleDesc, TupleTableSlot,
+        makeStringInfo, pfree, pq_beginmessage_reuse, pq_endmessage_reuse, pq_sendbytes,
+        resetStringInfo, slot_getallattrs, AsPgCStr, BlessTupleDesc, CommandDest,
+        CurrentMemoryContext, Datum, DestReceiver, MemoryContext, StringInfoData, TupleDesc,
+        TupleTableSlot,
     },
     prelude::*,
     AllocatedByPostgres, FromDatum, PgBox, PgMemoryContexts, PgTupleDesc,
@@ -26,6 +27,8 @@ pub(crate) struct JinjaDestReceiver {
     column_names: *mut Vec<String>,
     /// Reusable row dictionary (cleared between rows, avoids per-row Map allocation)
     row_dict: *mut Map<String, JsonValue>,
+    /// Reusable StringInfo buffer for send_copy_data (avoids per-row allocation)
+    copy_buf: *mut StringInfoData,
 }
 
 impl JinjaDestReceiver {
@@ -162,11 +165,12 @@ impl JinjaDestReceiver {
         }
     }
 
-    unsafe fn send_copy_data(&self, data: &[u8]) {
-        let buf = makeStringInfo();
-        pq_beginmessage(buf, b'd' as _);
+    unsafe fn send_copy_data(&mut self, data: &[u8]) {
+        let buf = self.copy_buf;
+        resetStringInfo(buf);
+        pq_beginmessage_reuse(buf, b'd' as _);
         pq_sendbytes(buf, data.as_ptr() as _, data.len() as _);
-        pq_endmessage(buf);
+        pq_endmessage_reuse(buf);
     }
 }
 
@@ -217,6 +221,9 @@ pub(crate) extern "C-unwind" fn jinja_startup(
 
         // Pre-allocate reusable row dictionary
         jinja_dest.row_dict = Box::into_raw(Box::new(Map::new()));
+
+        // Pre-allocate reusable StringInfo buffer for COPY data messages
+        jinja_dest.copy_buf = makeStringInfo();
 
         // Initialize Jinja environment and pre-compile the template
         let mut ctx = PgMemoryContexts::For(jinja_dest.memory_context);
@@ -275,6 +282,12 @@ pub(crate) extern "C-unwind" fn jinja_shutdown(dest: *mut DestReceiver) {
             let _ = Box::from_raw(jinja_dest.row_dict);
             jinja_dest.row_dict = std::ptr::null_mut();
         }
+
+        if !jinja_dest.copy_buf.is_null() {
+            pfree((*jinja_dest.copy_buf).data as _);
+            pfree(jinja_dest.copy_buf as _);
+            jinja_dest.copy_buf = std::ptr::null_mut();
+        }
     }
 }
 
@@ -319,6 +332,7 @@ pub(crate) extern "C-unwind" fn create_jinja_dest_receiver(
     jinja_dest.memory_context = memory_context;
     jinja_dest.column_names = std::ptr::null_mut();
     jinja_dest.row_dict = std::ptr::null_mut();
+    jinja_dest.copy_buf = std::ptr::null_mut();
 
     jinja_dest.into_pg()
 }
