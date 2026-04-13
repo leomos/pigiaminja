@@ -22,6 +22,8 @@ pub(crate) struct JinjaDestReceiver {
     env: *mut Environment<'static>,
     template_string: *mut String,
     memory_context: MemoryContext,
+    /// Cached column names (allocated once during startup, avoids per-row String allocs)
+    column_names: *mut Vec<String>,
 }
 
 impl JinjaDestReceiver {
@@ -34,22 +36,22 @@ impl JinjaDestReceiver {
             let datums = std::slice::from_raw_parts((*slot).tts_values, natts);
             let nulls = std::slice::from_raw_parts((*slot).tts_isnull, natts);
 
-            let tupledesc = PgTupleDesc::from_pg_unchecked(self.tupledesc);
+            let column_names = &*self.column_names;
 
             // Create a dictionary from the row data
             let mut row_dict = Map::new();
 
             for (idx, (datum, is_null)) in datums.iter().zip(nulls).enumerate() {
-                let attribute = tupledesc.get(idx).expect("cannot get attribute");
-                let attr_name = attribute.name();
+                let attr_name = &column_names[idx];
 
                 if *is_null {
-                    row_dict.insert(attr_name.to_string(), JsonValue::Null);
+                    row_dict.insert(attr_name.clone(), JsonValue::Null);
                 } else {
-                    // Convert datum to appropriate JSON value based on type
+                    let tupledesc = PgTupleDesc::from_pg_unchecked(self.tupledesc);
+                    let attribute = tupledesc.get(idx).expect("cannot get attribute");
                     let value =
                         self.datum_to_json_value(*datum, attribute.type_oid().value().into());
-                    row_dict.insert(attr_name.to_string(), value);
+                    row_dict.insert(attr_name.clone(), value);
                 }
             }
 
@@ -204,6 +206,14 @@ pub(crate) extern "C-unwind" fn jinja_startup(
         let tupledesc = PgTupleDesc::from_pg_unchecked(jinja_dest.tupledesc);
         jinja_dest.natts = tupledesc.len();
 
+        // Cache column names once (avoids per-row String allocations)
+        let mut column_names = Vec::with_capacity(jinja_dest.natts);
+        for idx in 0..jinja_dest.natts {
+            let attribute = tupledesc.get(idx).expect("cannot get attribute");
+            column_names.push(attribute.name().to_string());
+        }
+        jinja_dest.column_names = Box::into_raw(Box::new(column_names));
+
         // Initialize Jinja environment and pre-compile the template
         let mut ctx = PgMemoryContexts::For(jinja_dest.memory_context);
         ctx.switch_to(|_context| {
@@ -251,6 +261,11 @@ pub(crate) extern "C-unwind" fn jinja_shutdown(dest: *mut DestReceiver) {
             let _ = Box::from_raw(jinja_dest.template_string);
             jinja_dest.template_string = std::ptr::null_mut();
         }
+
+        if !jinja_dest.column_names.is_null() {
+            let _ = Box::from_raw(jinja_dest.column_names);
+            jinja_dest.column_names = std::ptr::null_mut();
+        }
     }
 }
 
@@ -293,6 +308,7 @@ pub(crate) extern "C-unwind" fn create_jinja_dest_receiver(
     jinja_dest.env = std::ptr::null_mut();
     jinja_dest.template_string = Box::into_raw(Box::new(template_string));
     jinja_dest.memory_context = memory_context;
+    jinja_dest.column_names = std::ptr::null_mut();
 
     jinja_dest.into_pg()
 }
