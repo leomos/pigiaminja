@@ -9,32 +9,33 @@
 Flamegraph profiler for pigiaminja.
 
 Profiles the PostgreSQL backend while running a pigiaminja COPY TO query
-and generates a flamegraph SVG.
+and generates a flamegraph.
 
-Sampling backends:
-  - perf (preferred, requires linux-tools matching your kernel)
-  - gdb  (fallback, lower precision but works everywhere)
-
-Flamegraph rendering:
-  - inferno (install: cargo install inferno)
+Sampling backends (in auto-detect priority order):
+  - samply  (best: opens Firefox Profiler UI, install: cargo install --locked samply)
+  - perf    (generates SVG via inferno, requires linux-tools matching your kernel)
+  - gdb     (fallback, lower precision but works everywhere, SVG via inferno)
 
 Prerequisites:
   1. PostgreSQL running with pigiaminja loaded and a bench_data table
      (run bench.py first to create it, or use --setup-table)
   2. Build pigiaminja with debug symbols for meaningful stack frames:
        CARGO_PROFILE_RELEASE_DEBUG=2 cargo pgrx install --release ...
-  3. Install inferno for SVG generation:
-       cargo install inferno
+  3. Install a profiling backend:
+       cargo install --locked samply    # recommended
+       # or: ensure perf + cargo install inferno
+       # or: ensure gdb + cargo install inferno
 
 Usage:
-  uv run benchmark/flamegraph.py
-  uv run benchmark/flamegraph.py --backend perf --rows 500000
-  uv run benchmark/flamegraph.py --output my_profile.svg --setup-table
+  uv run benchmark/flamegraph.py --setup-table
+  uv run benchmark/flamegraph.py --backend samply --rows 500000
+  uv run benchmark/flamegraph.py --backend perf -o profile.svg
 """
 
 import argparse
 import collections
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -190,6 +191,50 @@ def fold_perf_script(text):
     return stacks
 
 
+# --- samply backend ---
+
+def check_samply():
+    """Check if samply is installed."""
+    return shutil.which("samply") is not None
+
+
+def profile_with_samply(pid, conn, freq, output):
+    """Profile using samply record -p PID, writes a Firefox Profiler json.gz."""
+    # samply outputs profile.json.gz by default
+    samply_output = output if output.endswith(".json.gz") else output + ".json.gz"
+
+    samply_proc = subprocess.Popen(
+        ["samply", "record", "-p", str(pid),
+         "--rate", str(freq), "--save-only", "-o", samply_output],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+
+    # Give samply a moment to attach
+    time.sleep(0.3)
+
+    # Run the query
+    t0 = time.perf_counter()
+    total_bytes = run_query(conn)
+    elapsed = time.perf_counter() - t0
+    print(f"  Query completed in {elapsed:.3f}s, {total_bytes:,} bytes")
+
+    # Stop samply gracefully with SIGINT (it needs this to finalize the profile)
+    samply_proc.send_signal(signal.SIGINT)
+    try:
+        samply_proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        samply_proc.kill()
+
+    if not os.path.exists(samply_output):
+        stderr = samply_proc.stderr.read().decode() if samply_proc.stderr else ""
+        print(f"  ERROR: samply did not produce output file: {samply_output}")
+        if stderr:
+            print(f"  stderr: {stderr}")
+        sys.exit(1)
+
+    return samply_output
+
+
 # --- GDB backend ---
 
 def get_stack_gdb(pid):
@@ -305,12 +350,12 @@ def main():
         description="Generate a flamegraph for pigiaminja COPY TO queries",
     )
     parser.add_argument(
-        "--backend", choices=["perf", "gdb", "auto"], default="auto",
-        help="Sampling backend (default: auto-detect)",
+        "--backend", choices=["samply", "perf", "gdb", "auto"], default="auto",
+        help="Sampling backend (default: auto-detect, prefers samply > perf > gdb)",
     )
     parser.add_argument(
-        "--output", "-o", default="flamegraph.svg",
-        help="Output SVG path (default: flamegraph.svg)",
+        "--output", "-o", default=None,
+        help="Output path (default: profile.json.gz for samply, flamegraph.svg for perf/gdb)",
     )
     parser.add_argument(
         "--rows", type=int, default=100_000,
@@ -331,18 +376,29 @@ def main():
 
     # Pick backend
     if args.backend == "auto":
-        if check_perf():
+        if check_samply():
+            backend = "samply"
+        elif check_perf():
             backend = "perf"
         elif shutil.which("gdb"):
             backend = "gdb"
         else:
-            print("ERROR: Neither perf nor gdb found. Install one of them.")
+            print("ERROR: No profiling backend found. Install one of:")
+            print("  cargo install --locked samply   (recommended)")
+            print("  apt install linux-tools-$(uname -r)   (perf)")
+            print("  apt install gdb   (fallback)")
             sys.exit(1)
     else:
         backend = args.backend
 
+    # Set default output based on backend
+    if args.output is None:
+        output = "profile.json.gz" if backend == "samply" else "flamegraph.svg"
+    else:
+        output = args.output
+
     print(f"  Backend: {backend}")
-    print(f"  Output:  {args.output}")
+    print(f"  Output:  {output}")
 
     # Connect
     conn = psycopg.connect(args.dsn, autocommit=True)
@@ -363,21 +419,31 @@ def main():
 
     # Profile
     print(f"  Profiling with {backend}...")
-    if backend == "perf":
+    if backend == "samply":
+        samply_output = profile_with_samply(pid, conn, args.freq, output)
+        size = os.path.getsize(samply_output)
+        print(f"\n  Profile written to: {samply_output} ({size:,} bytes)")
+        print(f"  View with: samply load {samply_output}")
+    elif backend == "perf":
         collapsed = profile_with_perf(pid, conn, args.freq)
+        print(f"\n  Generating flamegraph...")
+        title = f"pigiaminja COPY TO ({count:,} rows, {backend})"
+        ok = render_flamegraph(collapsed, output, title)
+        if ok:
+            print(f"\n  Flamegraph written to: {output}")
+        else:
+            print(f"\n  Collapsed stacks at: {collapsed}")
+            print(f"  Install inferno to render: cargo install inferno")
     else:
         collapsed = profile_with_gdb(pid, conn)
-
-    # Render flamegraph
-    print(f"\n  Generating flamegraph...")
-    title = f"pigiaminja COPY TO ({count:,} rows, {backend})"
-    ok = render_flamegraph(collapsed, args.output, title)
-
-    if ok:
-        print(f"\n  Flamegraph written to: {args.output}")
-    else:
-        print(f"\n  Collapsed stacks at: {collapsed}")
-        print(f"  Install inferno to render: cargo install inferno")
+        print(f"\n  Generating flamegraph...")
+        title = f"pigiaminja COPY TO ({count:,} rows, {backend})"
+        ok = render_flamegraph(collapsed, output, title)
+        if ok:
+            print(f"\n  Flamegraph written to: {output}")
+        else:
+            print(f"\n  Collapsed stacks at: {collapsed}")
+            print(f"  Install inferno to render: cargo install inferno")
 
     conn.close()
 
