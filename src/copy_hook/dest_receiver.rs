@@ -24,6 +24,8 @@ pub(crate) struct JinjaDestReceiver {
     memory_context: MemoryContext,
     /// Cached column names (allocated once during startup, avoids per-row String allocs)
     column_names: *mut Vec<String>,
+    /// Reusable row dictionary (cleared between rows, avoids per-row Map allocation)
+    row_dict: *mut Map<String, JsonValue>,
 }
 
 impl JinjaDestReceiver {
@@ -37,9 +39,8 @@ impl JinjaDestReceiver {
             let nulls = std::slice::from_raw_parts((*slot).tts_isnull, natts);
 
             let column_names = &*self.column_names;
-
-            // Create a dictionary from the row data
-            let mut row_dict = Map::new();
+            let row_dict = &mut *self.row_dict;
+            row_dict.clear();
 
             for (idx, (datum, is_null)) in datums.iter().zip(nulls).enumerate() {
                 let attr_name = &column_names[idx];
@@ -65,7 +66,7 @@ impl JinjaDestReceiver {
                 .get_template(TEMPLATE_NAME)
                 .expect("Pre-compiled template not found");
 
-            match template.render(context! { row => row_dict }) {
+            match template.render(context! { row => &*row_dict }) {
                 Ok(rendered) => self.send_copy_data(rendered.as_bytes()),
                 Err(e) => pgrx::error!("Failed to render Jinja template: {}", e),
             }
@@ -214,6 +215,9 @@ pub(crate) extern "C-unwind" fn jinja_startup(
         }
         jinja_dest.column_names = Box::into_raw(Box::new(column_names));
 
+        // Pre-allocate reusable row dictionary
+        jinja_dest.row_dict = Box::into_raw(Box::new(Map::new()));
+
         // Initialize Jinja environment and pre-compile the template
         let mut ctx = PgMemoryContexts::For(jinja_dest.memory_context);
         ctx.switch_to(|_context| {
@@ -266,6 +270,11 @@ pub(crate) extern "C-unwind" fn jinja_shutdown(dest: *mut DestReceiver) {
             let _ = Box::from_raw(jinja_dest.column_names);
             jinja_dest.column_names = std::ptr::null_mut();
         }
+
+        if !jinja_dest.row_dict.is_null() {
+            let _ = Box::from_raw(jinja_dest.row_dict);
+            jinja_dest.row_dict = std::ptr::null_mut();
+        }
     }
 }
 
@@ -309,6 +318,7 @@ pub(crate) extern "C-unwind" fn create_jinja_dest_receiver(
     jinja_dest.template_string = Box::into_raw(Box::new(template_string));
     jinja_dest.memory_context = memory_context;
     jinja_dest.column_names = std::ptr::null_mut();
+    jinja_dest.row_dict = std::ptr::null_mut();
 
     jinja_dest.into_pg()
 }
