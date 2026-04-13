@@ -12,6 +12,8 @@ use pgrx::{
 };
 use serde_json::{Map, Value as JsonValue};
 
+const TEMPLATE_NAME: &str = "row";
+
 #[repr(C)]
 pub(crate) struct JinjaDestReceiver {
     dest: DestReceiver,
@@ -51,17 +53,17 @@ impl JinjaDestReceiver {
                 }
             }
 
-            // Render the template with the row data
+            // Use pre-compiled template instead of render_str (which recompiles per row)
             let env = self
                 .env
                 .as_ref()
                 .expect("Jinja environment not initialized");
-            let template_string = self
-                .template_string
-                .as_ref()
-                .expect("Template content not loaded");
 
-            match env.render_str(template_string, context! { row => row_dict }) {
+            let template = env
+                .get_template(TEMPLATE_NAME)
+                .expect("Pre-compiled template not found");
+
+            match template.render(context! { row => row_dict }) {
                 Ok(rendered) => self.send_copy_data(rendered.as_bytes()),
                 Err(e) => pgrx::error!("Failed to render Jinja template: {}", e),
             }
@@ -202,11 +204,14 @@ pub(crate) extern "C-unwind" fn jinja_startup(
         let tupledesc = PgTupleDesc::from_pg_unchecked(jinja_dest.tupledesc);
         jinja_dest.natts = tupledesc.len();
 
-        // Initialize Jinja environment
+        // Initialize Jinja environment and pre-compile the template
         let mut ctx = PgMemoryContexts::For(jinja_dest.memory_context);
         ctx.switch_to(|_context| {
-            let env = Box::new(Environment::new());
-            jinja_dest.env = Box::into_raw(env);
+            let template_string = &*jinja_dest.template_string;
+            let mut env = Environment::new();
+            env.add_template_owned(TEMPLATE_NAME.to_owned(), template_string.clone())
+                .unwrap_or_else(|e| pgrx::error!("Failed to compile Jinja template: {}", e));
+            jinja_dest.env = Box::into_raw(Box::new(env));
         });
     }
 }
