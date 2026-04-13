@@ -34,3 +34,9 @@ panic = "unwind"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+
+# Build with: CARGO_PROFILE_RELEASE_DEBUG=2 cargo pgrx install --release ...
+# This profile is for standalone Cargo builds (not pgrx install).
+[profile.profiling]
+inherits = "release"
+debug = 2
