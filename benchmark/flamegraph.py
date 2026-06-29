@@ -48,7 +48,10 @@ import psycopg
 
 # --- Constants ---
 
-DSN = "host=/var/run/postgresql dbname=postgres user=postgres password=benchpass"
+if sys.platform == "darwin":
+    DSN = "host=localhost port=28818 dbname=postgres"
+else:
+    DSN = "host=/var/run/postgresql dbname=postgres user=postgres password=benchpass"
 COLUMNS = "id, name, email, department, salary, is_active, score, created_at, notes"
 JINJA_TEMPLATE = (
     "{{ row.id }},{{ row.name }},{{ row.email }},{{ row.department }},"
