@@ -25,7 +25,12 @@ enum ColumnConv {
     Float4,
     Float8,
     Bool,
+    /// `json` (OID 114): a *text* varlena, parsed with `serde_json` directly.
     Json,
+    /// `jsonb` (OID 3802): a *binary* varlena, decoded via the `jsonb_out`
+    /// function. Decoding a `json` datum with this path (or vice versa) reads
+    /// the wrong varlena layout and corrupts memory, so the two are distinct.
+    Jsonb,
     /// Fallback for any other type: call the type's text output function, whose
     /// lookup (`getTypeOutputInfo` + `fmgr_info`) is done once and cached here.
     Output { flinfo: pg_sys::FmgrInfo },
@@ -182,6 +187,9 @@ unsafe fn convert_datum(datum: Datum, conv: &mut ColumnConv) -> Value {
         }),
         ColumnConv::Bool => bool::from_datum(datum, false).map_or(Value::from(()), Value::from),
         ColumnConv::Json => {
+            pgrx::Json::from_datum(datum, false).map_or(Value::from(()), |j| Value::from_serialize(j.0))
+        }
+        ColumnConv::Jsonb => {
             pgrx::JsonB::from_datum(datum, false).map_or(Value::from(()), |j| Value::from_serialize(j.0))
         }
         ColumnConv::Output { flinfo } => {
@@ -213,7 +221,8 @@ unsafe fn column_conv_for(type_oid: u32, memory_context: MemoryContext) -> Colum
         700 => ColumnConv::Float4, // FLOAT4OID
         701 => ColumnConv::Float8, // FLOAT8OID
         16 => ColumnConv::Bool,    // BOOLOID
-        114 | 3802 => ColumnConv::Json, // JSONOID | JSONBOID
+        114 => ColumnConv::Json,    // JSONOID (text varlena)
+        3802 => ColumnConv::Jsonb,  // JSONBOID (binary varlena)
         _ => {
             // Cache the type's output function so the per-row path skips the
             // getTypeOutputInfo + fmgr_info catalog lookups entirely.
