@@ -19,7 +19,7 @@ pub(crate) fn pg_analyze_and_rewrite(
         )
     }
 
-    #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
+    #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17", feature = "pg18"))]
     unsafe {
         pgrx::pg_sys::pg_analyze_and_rewrite_fixedparams(
             raw_stmt,

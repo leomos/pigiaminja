@@ -234,11 +234,23 @@ fn execute_copy_to_with_dest_receiver(
         };
 
         // Execute the query with our custom DestReceiver
+        #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
         PortalRun(
             portal.as_ptr(),
             i64::MAX,
             false,
             true,
+            jinja_dest.as_ptr(),
+            jinja_dest.as_ptr(),
+            &mut completion_tag as _,
+        );
+
+        // PG18 removed the run_once parameter from PortalRun
+        #[cfg(feature = "pg18")]
+        PortalRun(
+            portal.as_ptr(),
+            i64::MAX,
+            false,
             jinja_dest.as_ptr(),
             jinja_dest.as_ptr(),
             &mut completion_tag as _,

@@ -112,7 +112,7 @@ Assuming you already have `cargo` installed:
 ```
 $ git clone https://github.com/leomos/pigiaminja
 $ cd pigiaminja
-$ export CARGO_PGRX_VERSION=0.15.0
+$ export CARGO_PGRX_VERSION=0.16.1
 $ export PG_MAJOR=17
 $ cargo install --force --locked cargo-pgrx@"${CARGO_PGRX_VERSION}"
 $ cargo pgrx init 
