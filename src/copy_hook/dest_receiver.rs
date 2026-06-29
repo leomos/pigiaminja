@@ -1,19 +1,61 @@
 use std::ffi::{c_char, CStr};
+use std::sync::Arc;
 
-use minijinja::{context, Environment};
+use minijinja::value::{Enumerator, Object};
+use minijinja::{context, Environment, Value};
 use pgrx::{
     pg_sys::{
-        makeStringInfo, pfree, pq_beginmessage_reuse, pq_endmessage_reuse, pq_sendbytes,
-        resetStringInfo, slot_getallattrs, AsPgCStr, BlessTupleDesc, CommandDest,
-        CurrentMemoryContext, Datum, DestReceiver, MemoryContext, StringInfoData, TupleDesc,
-        TupleTableSlot,
+        makeStringInfo, pfree, pq_beginmessage_reuse, pq_endmessage_reuse, slot_getallattrs,
+        AsPgCStr, BlessTupleDesc, CommandDest, CurrentMemoryContext, Datum, DestReceiver,
+        MemoryContext, StringInfoData, TupleDesc, TupleTableSlot,
     },
     prelude::*,
     AllocatedByPostgres, FromDatum, PgBox, PgMemoryContexts, PgTupleDesc,
 };
-use serde_json::{Map, Value as JsonValue};
 
 const TEMPLATE_NAME: &str = "row";
+
+/// How to turn a column's datum into a minijinja value. Resolved once at startup
+/// from the column's type OID so the per-row hot path performs no catalog lookups.
+enum ColumnConv {
+    Text,
+    Int2,
+    Int4,
+    Int8,
+    Float4,
+    Float8,
+    Bool,
+    Json,
+    /// Fallback for any other type: call the type's text output function, whose
+    /// lookup (`getTypeOutputInfo` + `fmgr_info`) is done once and cached here.
+    Output { flinfo: pg_sys::FmgrInfo },
+}
+
+/// A single output row exposed to the Jinja template as the `row` map (so the
+/// template can reference `row.<column>`). Holds the converted cell values plus
+/// the shared (Arc) column names. The per-row cost is one `Vec` + one `Arc`
+/// allocation, instead of building a serde_json map and re-serialising it into a
+/// minijinja value (two map representations) on every row.
+#[derive(Debug)]
+struct RowObject {
+    names: Arc<Vec<Box<str>>>,
+    values: Vec<Value>,
+}
+
+impl Object for RowObject {
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        let key = key.as_str()?;
+        let idx = self.names.iter().position(|name| name.as_ref() == key)?;
+        Some(self.values[idx].clone())
+    }
+
+    fn enumerate(self: &Arc<Self>) -> Enumerator {
+        let names = self.names.clone();
+        Enumerator::Iter(Box::new(
+            (0..names.len()).map(move |i| Value::from(names[i].as_ref())),
+        ))
+    }
+}
 
 #[repr(C)]
 pub(crate) struct JinjaDestReceiver {
@@ -23,11 +65,11 @@ pub(crate) struct JinjaDestReceiver {
     env: *mut Environment<'static>,
     template_string: *mut String,
     memory_context: MemoryContext,
-    /// Cached column names (allocated once during startup, avoids per-row String allocs)
-    column_names: *mut Vec<String>,
-    /// Reusable row dictionary (cleared between rows, avoids per-row Map allocation)
-    row_dict: *mut Map<String, JsonValue>,
-    /// Reusable StringInfo buffer for send_copy_data (avoids per-row allocation)
+    /// Shared column names, Arc-cloned into each row (never re-allocated per row).
+    column_names: *mut Arc<Vec<Box<str>>>,
+    /// Per-column datum converters, resolved once at startup.
+    column_convs: *mut Vec<ColumnConv>,
+    /// Reusable StringInfo buffer for COPY data messages (avoids per-row allocation).
     copy_buf: *mut StringInfoData,
 }
 
@@ -41,23 +83,22 @@ impl JinjaDestReceiver {
             let datums = std::slice::from_raw_parts((*slot).tts_values, natts);
             let nulls = std::slice::from_raw_parts((*slot).tts_isnull, natts);
 
-            let column_names = &*self.column_names;
-            let row_dict = &mut *self.row_dict;
-            row_dict.clear();
+            let convs = &mut *self.column_convs;
+            let names = &*self.column_names;
 
+            let mut values = Vec::with_capacity(natts);
             for (idx, (datum, is_null)) in datums.iter().zip(nulls).enumerate() {
-                let attr_name = &column_names[idx];
-
-                if *is_null {
-                    row_dict.insert(attr_name.clone(), JsonValue::Null);
+                values.push(if *is_null {
+                    Value::from(())
                 } else {
-                    let tupledesc = PgTupleDesc::from_pg_unchecked(self.tupledesc);
-                    let attribute = tupledesc.get(idx).expect("cannot get attribute");
-                    let value =
-                        self.datum_to_json_value(*datum, attribute.type_oid().value().into());
-                    row_dict.insert(attr_name.clone(), value);
-                }
+                    convert_datum(*datum, &mut convs[idx])
+                });
             }
+
+            let row = Value::from_object(RowObject {
+                names: names.clone(),
+                values,
+            });
 
             // Use pre-compiled template instead of render_str (which recompiles per row)
             let env = self
@@ -69,128 +110,125 @@ impl JinjaDestReceiver {
                 .get_template(TEMPLATE_NAME)
                 .expect("Pre-compiled template not found");
 
-            match template.render(context! { row => &*row_dict }) {
-                Ok(rendered) => self.send_copy_data(rendered.as_bytes()),
-                Err(e) => pgrx::error!("Failed to render Jinja template: {}", e),
+            // Render directly into the reused COPY-data buffer. Avoids a per-row
+            // output String allocation plus an extra full-row copy.
+            let buf = self.copy_buf;
+            pq_beginmessage_reuse(buf, b'd' as _);
+            if let Err(e) =
+                template.render_to_write(context! { row => row }, StringInfoWriter(buf))
+            {
+                pgrx::error!("Failed to render Jinja template: {}", e);
             }
+            pq_endmessage_reuse(buf);
         }
-    }
-
-    fn datum_to_json_value(&self, datum: Datum, type_oid: u32) -> JsonValue {
-        unsafe {
-            match type_oid {
-                // Text types
-                25 | 1043 | 1042 | 19 => {
-                    // TEXTOID | VARCHAROID | BPCHAROID | NAMEOID
-                    if let Some(text) = String::from_datum(datum, false) {
-                        JsonValue::String(text)
-                    } else {
-                        JsonValue::Null
-                    }
-                }
-                // Integer types
-                21 => {
-                    // INT2OID
-                    if let Some(val) = i16::from_datum(datum, false) {
-                        JsonValue::Number(val.into())
-                    } else {
-                        JsonValue::Null
-                    }
-                }
-                23 => {
-                    // INT4OID
-                    if let Some(val) = i32::from_datum(datum, false) {
-                        JsonValue::Number(val.into())
-                    } else {
-                        JsonValue::Null
-                    }
-                }
-                20 => {
-                    // INT8OID
-                    if let Some(val) = i64::from_datum(datum, false) {
-                        JsonValue::Number(val.into())
-                    } else {
-                        JsonValue::Null
-                    }
-                }
-                // Float types
-                700 => {
-                    // FLOAT4OID
-                    if let Some(val) = f32::from_datum(datum, false) {
-                        serde_json::Number::from_f64(val as f64)
-                            .map(JsonValue::Number)
-                            .unwrap_or(JsonValue::Null)
-                    } else {
-                        JsonValue::Null
-                    }
-                }
-                701 => {
-                    // FLOAT8OID
-                    if let Some(val) = f64::from_datum(datum, false) {
-                        serde_json::Number::from_f64(val)
-                            .map(JsonValue::Number)
-                            .unwrap_or(JsonValue::Null)
-                    } else {
-                        JsonValue::Null
-                    }
-                }
-                // Boolean
-                16 => {
-                    // BOOLOID
-                    if let Some(val) = bool::from_datum(datum, false) {
-                        JsonValue::Bool(val)
-                    } else {
-                        JsonValue::Null
-                    }
-                }
-                // JSON/JSONB
-                114 | 3802 => {
-                    // JSONOID | JSONBOID
-                    if let Some(json) = pgrx::JsonB::from_datum(datum, false) {
-                        json.0
-                    } else {
-                        JsonValue::Null
-                    }
-                }
-                // Default: convert to text
-                _ => {
-                    // Use PostgreSQL's output function to convert to text
-                    if let Ok(text) = datum_to_text(datum, type_oid) {
-                        JsonValue::String(text)
-                    } else {
-                        JsonValue::Null
-                    }
-                }
-            }
-        }
-    }
-
-    unsafe fn send_copy_data(&mut self, data: &[u8]) {
-        let buf = self.copy_buf;
-        resetStringInfo(buf);
-        pq_beginmessage_reuse(buf, b'd' as _);
-        pq_sendbytes(buf, data.as_ptr() as _, data.len() as _);
-        pq_endmessage_reuse(buf);
     }
 }
 
-// Helper function to convert datum to text using PostgreSQL's output function
-unsafe fn datum_to_text(datum: Datum, type_oid: u32) -> Result<String, &'static str> {
-    let mut typoutput: pg_sys::Oid = pg_sys::Oid::INVALID;
-    let mut typvarlena: bool = false;
+/// `std::io::Write` adapter that appends bytes straight into a Postgres
+/// `StringInfo`, letting the template render directly into the COPY send buffer.
+struct StringInfoWriter(*mut StringInfoData);
 
-    pg_sys::getTypeOutputInfo(pg_sys::Oid::from(type_oid), &mut typoutput, &mut typvarlena);
-
-    if typoutput == pg_sys::Oid::INVALID {
-        return Err("Invalid output function");
+impl std::io::Write for StringInfoWriter {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        unsafe {
+            pg_sys::appendBinaryStringInfo(self.0, buf.as_ptr() as *const _, buf.len() as _);
+        }
+        Ok(buf.len())
     }
 
-    let result = pg_sys::OidOutputFunctionCall(typoutput, datum);
+    #[inline]
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        unsafe {
+            pg_sys::appendBinaryStringInfo(self.0, buf.as_ptr() as *const _, buf.len() as _);
+        }
+        Ok(())
+    }
 
-    CStr::from_ptr(result as *const c_char)
-        .to_str()
-        .map(|s| s.to_string())
-        .map_err(|_| "Failed to convert to UTF-8")
+    #[inline]
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Convert a single non-null `datum` into a minijinja value using the
+/// precomputed converter for its column.
+///
+/// # Safety
+/// `datum` must be a valid datum of the column type `conv` was built for.
+unsafe fn convert_datum(datum: Datum, conv: &mut ColumnConv) -> Value {
+    match conv {
+        // Borrow the text out of the datum (detoasted) and let minijinja inline
+        // short strings as SmallStr; no intermediate String allocation.
+        ColumnConv::Text => {
+            <&str>::from_datum(datum, false).map_or(Value::from(()), |s| Value::from(s))
+        }
+        ColumnConv::Int2 => i16::from_datum(datum, false).map_or(Value::from(()), Value::from),
+        ColumnConv::Int4 => i32::from_datum(datum, false).map_or(Value::from(()), Value::from),
+        ColumnConv::Int8 => i64::from_datum(datum, false).map_or(Value::from(()), Value::from),
+        ColumnConv::Float4 => f32::from_datum(datum, false).map_or(Value::from(()), |v| {
+            if v.is_finite() {
+                Value::from(v)
+            } else {
+                Value::from(())
+            }
+        }),
+        ColumnConv::Float8 => f64::from_datum(datum, false).map_or(Value::from(()), |v| {
+            if v.is_finite() {
+                Value::from(v)
+            } else {
+                Value::from(())
+            }
+        }),
+        ColumnConv::Bool => bool::from_datum(datum, false).map_or(Value::from(()), Value::from),
+        ColumnConv::Json => {
+            pgrx::JsonB::from_datum(datum, false).map_or(Value::from(()), |j| Value::from_serialize(j.0))
+        }
+        ColumnConv::Output { flinfo } => {
+            let cstr = pg_sys::OutputFunctionCall(flinfo as *mut pg_sys::FmgrInfo, datum);
+            if cstr.is_null() {
+                Value::from(())
+            } else {
+                match CStr::from_ptr(cstr as *const c_char).to_str() {
+                    Ok(s) => Value::from(s),
+                    Err(_) => Value::from(()),
+                }
+            }
+        }
+    }
+}
+
+/// Resolve the converter for a column's type OID. For the fallback path this
+/// looks up the type's output function once and caches it in `memory_context`.
+///
+/// # Safety
+/// Must run inside a Postgres backend (performs catalog lookups).
+unsafe fn column_conv_for(type_oid: u32, memory_context: MemoryContext) -> ColumnConv {
+    match type_oid {
+        // Text types: TEXTOID | VARCHAROID | BPCHAROID | NAMEOID
+        25 | 1043 | 1042 | 19 => ColumnConv::Text,
+        21 => ColumnConv::Int2,    // INT2OID
+        23 => ColumnConv::Int4,    // INT4OID
+        20 => ColumnConv::Int8,    // INT8OID
+        700 => ColumnConv::Float4, // FLOAT4OID
+        701 => ColumnConv::Float8, // FLOAT8OID
+        16 => ColumnConv::Bool,    // BOOLOID
+        114 | 3802 => ColumnConv::Json, // JSONOID | JSONBOID
+        _ => {
+            // Cache the type's output function so the per-row path skips the
+            // getTypeOutputInfo + fmgr_info catalog lookups entirely.
+            let mut typoutput = pg_sys::Oid::INVALID;
+            let mut typisvarlena = false;
+            pg_sys::getTypeOutputInfo(
+                pg_sys::Oid::from(type_oid),
+                &mut typoutput,
+                &mut typisvarlena,
+            );
+            let mut flinfo: pg_sys::FmgrInfo = std::mem::zeroed();
+            pg_sys::fmgr_info_cxt(typoutput, &mut flinfo, memory_context);
+            ColumnConv::Output { flinfo }
+        }
+    }
 }
 
 #[pg_guard]
@@ -211,16 +249,18 @@ pub(crate) extern "C-unwind" fn jinja_startup(
         let tupledesc = PgTupleDesc::from_pg_unchecked(jinja_dest.tupledesc);
         jinja_dest.natts = tupledesc.len();
 
-        // Cache column names once (avoids per-row String allocations)
-        let mut column_names = Vec::with_capacity(jinja_dest.natts);
+        // Cache per-column name + converter once. This pulls the type OID and
+        // (for fallback types) the output function out of the per-row loop.
+        let mut names = Vec::with_capacity(jinja_dest.natts);
+        let mut convs = Vec::with_capacity(jinja_dest.natts);
         for idx in 0..jinja_dest.natts {
             let attribute = tupledesc.get(idx).expect("cannot get attribute");
-            column_names.push(attribute.name().to_string());
+            let type_oid: u32 = attribute.type_oid().value().into();
+            names.push(attribute.name().to_string().into_boxed_str());
+            convs.push(column_conv_for(type_oid, jinja_dest.memory_context));
         }
-        jinja_dest.column_names = Box::into_raw(Box::new(column_names));
-
-        // Pre-allocate reusable row dictionary
-        jinja_dest.row_dict = Box::into_raw(Box::new(Map::new()));
+        jinja_dest.column_names = Box::into_raw(Box::new(Arc::new(names)));
+        jinja_dest.column_convs = Box::into_raw(Box::new(convs));
 
         // Pre-allocate reusable StringInfo buffer for COPY data messages
         jinja_dest.copy_buf = makeStringInfo();
@@ -278,9 +318,9 @@ pub(crate) extern "C-unwind" fn jinja_shutdown(dest: *mut DestReceiver) {
             jinja_dest.column_names = std::ptr::null_mut();
         }
 
-        if !jinja_dest.row_dict.is_null() {
-            let _ = Box::from_raw(jinja_dest.row_dict);
-            jinja_dest.row_dict = std::ptr::null_mut();
+        if !jinja_dest.column_convs.is_null() {
+            let _ = Box::from_raw(jinja_dest.column_convs);
+            jinja_dest.column_convs = std::ptr::null_mut();
         }
 
         if !jinja_dest.copy_buf.is_null() {
@@ -331,7 +371,7 @@ pub(crate) extern "C-unwind" fn create_jinja_dest_receiver(
     jinja_dest.template_string = Box::into_raw(Box::new(template_string));
     jinja_dest.memory_context = memory_context;
     jinja_dest.column_names = std::ptr::null_mut();
-    jinja_dest.row_dict = std::ptr::null_mut();
+    jinja_dest.column_convs = std::ptr::null_mut();
     jinja_dest.copy_buf = std::ptr::null_mut();
 
     jinja_dest.into_pg()
