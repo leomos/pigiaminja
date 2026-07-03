@@ -123,6 +123,24 @@ $ cargo pgrx run --features pg"${PG_MAJOR}"
 psql> "CREATE EXTENSION pigiaminja;"
 ```
 
+## Benchmarks
+
+The `benchmark/` directory contains a script that compares pigiaminja's `COPY TO (FORMAT 'jinja')` against two alternatives: native `COPY TO (FORMAT 'csv')` and a plain `SELECT` with the formatting done client-side in Python.
+
+It needs a running PostgreSQL with pigiaminja loaded (the pgrx instance from the section above works fine, just check the DSN at the top of the script) and you can run it directly with [uv](https://docs.astral.sh/uv/), which takes care of the dependencies:
+
+```
+$ uv run benchmark/bench.py
+```
+
+For reference, on an M1 Max with PostgreSQL 18, exporting a million rows of a mixed-type table renders at ~435k rows/s: about 1.4x faster than formatting the same rows client-side with psycopg, and about 2.8x slower than native CSV, which is the price of rendering a template for every row.
+
+There's also a profiler that attaches to the PostgreSQL backend while it runs a pigiaminja `COPY` and produces a flamegraph, in case you want to see where the time goes:
+
+```
+$ uv run benchmark/flamegraph.py
+```
+
 ## Credits
 
 Implementation of the extension internals is heavily inspired by [pg_parquet](https://github.com/CrunchyData/pg_parquet).
