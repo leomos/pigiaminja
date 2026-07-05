@@ -123,6 +123,36 @@ $ cargo pgrx run --features pg"${PG_MAJOR}"
 psql> "CREATE EXTENSION pigiaminja;"
 ```
 
+## Writing to files and programs
+
+`TO STDOUT` is not the only destination: like regular `COPY`, the jinja format can write straight to a server-side file or pipe the rendered output through a program.
+
+```sql
+COPY (SELECT * FROM employees)
+TO '/tmp/employees.html'
+(FORMAT 'jinja', TEMPLATE '
+<tr>
+    <td>{{ row.name }}</td>
+</tr>
+');
+
+COPY (SELECT * FROM employees)
+TO PROGRAM 'gzip > /tmp/employees.html.gz'
+(FORMAT 'jinja', TEMPLATE '
+<tr>
+    <td>{{ row.name }}</td>
+</tr>
+');
+```
+
+Both happen on the server: the file lands on the server's filesystem and the program runs as the PostgreSQL server process. That is also why, exactly like regular `COPY`, they require superuser or the built-in `pg_write_server_files` / `pg_execute_server_program` roles. If what you want is a file on your machine, `psql`'s `\copy` does that for anyone by going through `STDOUT`:
+
+```
+\copy (SELECT * FROM employees) TO 'employees.html' (FORMAT 'jinja', TEMPLATE '{{ row.name }}')
+```
+
+There's a runnable version of all this in `examples/export_server_side.sql`, and `examples/export.py` shows the same client-side export from Python through psycopg.
+
 ## Benchmarks
 
 The `benchmark/` directory contains a script that compares pigiaminja's `COPY TO (FORMAT 'jinja')` against two alternatives: native `COPY TO (FORMAT 'csv')` and a plain `SELECT` with the formatting done client-side in Python.
